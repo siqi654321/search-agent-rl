@@ -1,0 +1,22 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      retrieval_service_url: http://127.0.0.1:1249/retrieve_summarize_compat
+      num_workers: 120
+      rate_limit: 120
+      timeout: 6000
+      type: native
+      topk: 10
+    tool_schema:
+      type: function
+      function:
+        name: local_search
+        description: Search Wikipedia via dense retrieval server and summarize results.
+        parameters:
+          type: object
+          properties: 
+            query:
+              type: string
+              description: Search query to retrieve relevant documents
+          required:
+            - query
