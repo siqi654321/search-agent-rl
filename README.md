@@ -6,8 +6,10 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 
 - retrieval service scripts in `retrieval/`
 - training patches and configs in `src/`
+- fully async training patches in `src/async/`
 - data conversion scripts in `data/`
 - the training entry script `train.sh`
+- the fully async training entry script `train_async.sh`
 - the BrowseComp+ evaluation entry script `browsecomp_plus_eval.sh`
 
 ## 1. Environment Setup
@@ -57,6 +59,7 @@ search-agent-rl/
 │   └── e5-base-v2/
 ├── retrieval/
 ├── src/
+├── train_async.sh
 ├── train.sh
 └── browsecomp_plus_eval.sh
 ```
@@ -130,6 +133,8 @@ export QUERY_ENCODER_MODEL=/path/to/Qwen3-Embedding-8B
 
 ## 3. Training
 
+### 3.1 Standard training
+
 Training entry point: `train.sh`
 
 The script does the following:
@@ -161,6 +166,52 @@ Logs are written to the repository root by default:
 
 - `retrieve.out`
 - `qwen3_1.7b.out`
+
+### 3.2 Fully async training
+
+Fully async training entry point: `train_async.sh`
+
+The script does the following:
+
+1. starts the local retrieval service `retrieval/retrieval_server_sglang_summarize.py`
+2. starts an SGLang server for `Qwen3-1.7B`
+3. syncs the base patches from `src/` into `verl/verl/`
+4. syncs the fully async patches from `src/async/` into `verl/verl/`
+5. launches fully async GRPO training through `verl.experimental.fully_async_policy.fully_async_main`
+
+Run fully async training with:
+
+```bash
+bash train_async.sh
+```
+
+Common override example:
+
+```bash
+SGLANG_MODEL_PATH=./models/Qwen3-1.7B \
+MODEL_PATH=./models/Qwen3-8B \
+INDEX_PATH=./data/e5_Flat.index \
+CORPUS_PATH=./data/wiki-18.jsonl \
+TRAIN_DATA=./data/asearcher_searchr1/train.parquet \
+VAL_DATA=./data/asearcher_searchr1/test.parquet \
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
+TRAIN_GPUS_PER_NODE=4 \
+ROLLOUT_GPUS_PER_NODE=2 \
+bash train_async.sh
+```
+
+Useful fully async overrides include:
+
+- `ROLLOUT_MODE=async`
+- `ROLLOUT_NAME=sglang`
+- `TRAIN_BATCH_SIZE`
+- `GEN_BATCH_SIZE`
+- `TOTAL_ROLLOUT_STEPS`
+- `STALENESS_THRESHOLD`
+- `MAX_CONCURRENT_SAMPLES`
+- `CKPTS_DIR`
+
+The script also keeps the process alive with `sleep infinity` after launching training, which is useful in some job schedulers.
 
 ## 4. Evaluation
 
