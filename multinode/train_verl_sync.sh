@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -xeuo pipefail
+
+ROOT_DIR="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+CONFIG_PATH="${CONFIG_PATH:-$ROOT_DIR/src/config}"
+CONFIG_NAME="${CONFIG_NAME:-search_multiturn_grpo}"
+
+TRAIN_DATA="${TRAIN_DATA:-$ROOT_DIR/data/asearcher_searchr1/train.parquet}"
+VAL_DATA="${VAL_DATA:-$ROOT_DIR/data/asearcher_searchr1/test.parquet}"
+TOOL_CONFIG="${TOOL_CONFIG:?TOOL_CONFIG must be provided by the Ray launcher}"
+
+PROJECT_NAME="${PROJECT_NAME:-search_r1_like_multinode_rl}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3-8b-search-multinode}"
+ACTOR_MODEL_PATH="${ACTOR_MODEL_PATH:-$ROOT_DIR/models/Qwen3-8B}"
+CKPTS_DIR="${CKPTS_DIR:-$ROOT_DIR/checkpoints/$PROJECT_NAME/$EXPERIMENT_NAME}"
+
+TRAIN_CUDA_VISIBLE_DEVICES="${TRAIN_CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+TRAIN_NNODES="${TRAIN_NNODES:-1}"
+TRAIN_GPUS_PER_NODE="${TRAIN_GPUS_PER_NODE:-4}"
+RAY_ADDRESS="${RAY_ADDRESS:-auto}"
+
+export PYTHONPATH="$ROOT_DIR/verl${PYTHONPATH:+:$PYTHONPATH}"
+
+CUDA_VISIBLE_DEVICES="$TRAIN_CUDA_VISIBLE_DEVICES" python3 -m verl.trainer.main_ppo \
+    --config-path="$CONFIG_PATH" \
+    --config-name="$CONFIG_NAME" \
+    algorithm.adv_estimator=grpo \
+    data.shuffle=true \
+    data.seed=2026 \
+    data.train_batch_size=128 \
+    data.val_batch_size=256 \
+    data.max_prompt_length=4096 \
+    data.max_response_length=35000 \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    data.return_raw_chat=True \
+    actor_rollout_ref.model.path="$ACTOR_MODEL_PATH" \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.0001 \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=2 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.max_model_len=40000 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
+    actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=100 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=100 \
+    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.val_before_train=False \
+    trainer.logger='["console","wandb"]' \
+    trainer.project_name="$PROJECT_NAME" \
+    trainer.experiment_name="$EXPERIMENT_NAME" \
+    trainer.nnodes="$TRAIN_NNODES" \
+    trainer.n_gpus_per_node="$TRAIN_GPUS_PER_NODE" \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
+    trainer.save_freq=50 \
+    trainer.test_freq=50 \
+    trainer.default_local_dir="$CKPTS_DIR" \
+    data.train_files="$TRAIN_DATA" \
+    data.val_files="$VAL_DATA" \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path="$TOOL_CONFIG" \
+    algorithm.rollout_correction.bypass_mode=false \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold=2.0 \
+    algorithm.rollout_correction.rollout_is_batch_normalize=false \
+    actor_rollout_ref.rollout.calculate_log_probs=true \
+    trainer.total_epochs=3 \
+    +ray_kwargs.ray_init.address="$RAY_ADDRESS"

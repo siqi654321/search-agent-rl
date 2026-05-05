@@ -213,6 +213,84 @@ Useful fully async overrides include:
 
 The script also keeps the process alive with `sleep infinity` after launching training, which is useful in some job schedulers.
 
+### 3.3 Multinode sync training
+
+Multinode entry scripts:
+
+- environment sync on every node: `multinode/setup_env.sh`
+- Ray job submit on the head node: `multinode/launch.sh`
+- training entry inside the Ray job: `multinode/train_verl_sync.sh`
+
+The multinode workflow is:
+
+1. start a multi-node Ray cluster manually
+2. run `multinode/setup_env.sh` on every node to sync the required patches into `verl/`
+3. run `multinode/launch.sh` on the Ray head node
+4. the launcher submits a Ray job that executes `src/multinode/ray_launch_sync_training.py`
+5. the Ray job starts the summary service and retrieval service, then runs `multinode/train_verl_sync.sh`
+
+Run the environment sync on every node first:
+
+```bash
+bash multinode/setup_env.sh
+```
+
+Then submit the training job on the Ray head node:
+
+```bash
+bash multinode/launch.sh
+```
+
+Common override example:
+
+```bash
+RAY_ADDRESS=auto \
+TRAIN_NNODES=8 \
+TRAIN_GPUS_PER_NODE=4 \
+SUMMARY_TP=1 \
+RETRIEVAL_NUM_GPUS=1 \
+SUMMARY_MODEL_PATH=./models/Qwen3-1.7B \
+ACTOR_MODEL_PATH=./models/Qwen3-8B \
+RETRIEVER_MODEL=./models/e5-base-v2 \
+INDEX_PATH=./data/e5_Flat.index \
+CORPUS_PATH=./data/wiki-18.jsonl \
+EXPERIMENT_NAME=qwen3-8b-search-multinode \
+bash multinode/launch.sh
+```
+
+Useful multinode overrides include:
+
+- `RAY_ADDRESS`
+- `SERVICE_MODE`
+- `CONFIG_PATH`
+- `TOOL_CONFIG_TEMPLATE`
+- `TRAINING_SCRIPT`
+- `TRAIN_DATA`
+- `VAL_DATA`
+- `RETRIEVAL_SCRIPT`
+- `INDEX_PATH`
+- `CORPUS_PATH`
+- `RETRIEVER_MODEL`
+- `SUMMARY_MODEL_PATH`
+- `ACTOR_MODEL_PATH`
+- `PROJECT_NAME`
+- `EXPERIMENT_NAME`
+- `SUMMARY_TP`
+- `SUMMARY_MEM_FRACTION`
+- `SUMMARY_PORT`
+- `SUMMARY_STARTUP_TIMEOUT_S`
+- `RETRIEVAL_PORT`
+- `RETRIEVAL_STARTUP_TIMEOUT_S`
+- `RETRIEVAL_NUM_GPUS`
+- `TRAIN_CUDA_VISIBLE_DEVICES`
+- `TRAIN_NNODES`
+- `TRAIN_GPUS_PER_NODE`
+- `SUMMARY_VISIBLE_DEVICES`
+- `RETRIEVAL_VISIBLE_DEVICES`
+- `NODE_GPUS`
+- `CKPTS_DIR`
+- `RESUME_FROM_PATH`
+
 ## 4. Evaluation
 
 BrowseComp+ evaluation entry point: `browsecomp_plus_eval.sh`
