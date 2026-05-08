@@ -7,9 +7,11 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - retrieval service scripts in `retrieval/`
 - training patches and configs in `src/`
 - fully async training patches in `src/async/`
+- OPD training patches in `src/opd/`
 - data conversion scripts in `data/`
 - the training entry script `train.sh`
 - the fully async training entry script `train_async.sh`
+- the OPD training entry script `train_opd.sh`
 - the BrowseComp+ evaluation entry script `browsecomp_plus_eval.sh`
 
 ## 1. Environment Setup
@@ -59,6 +61,7 @@ search-agent-rl/
 │   └── e5-base-v2/
 ├── retrieval/
 ├── src/
+├── train_opd.sh
 ├── train_async.sh
 ├── train.sh
 └── browsecomp_plus_eval.sh
@@ -213,7 +216,59 @@ Useful fully async overrides include:
 
 The script also keeps the process alive with `sleep infinity` after launching training, which is useful in some job schedulers.
 
-### 3.3 Multinode sync training
+### 3.3 OPD training
+
+OPD training entry point: `train_opd.sh`
+
+The script does the following:
+
+1. starts the local retrieval service `retrieval/retrieval_server_sglang_summarize.py`
+2. starts an SGLang server for `Qwen3-1.7B`
+3. syncs the base patches from `src/` into `verl/verl/`
+4. syncs the OPD patches from `src/opd/` into `verl/verl/`
+5. launches GRPO training with on-policy distillation enabled through `verl.trainer.main_ppo`
+
+Run OPD training with:
+
+```bash
+bash train_opd.sh
+```
+
+Common override example:
+
+```bash
+SGLANG_MODEL_PATH=./models/Qwen3-1.7B \
+ACTOR_MODEL_PATH=./models/Qwen3-4B \
+TEACHER_MODEL_PATH=./models/Qwen3-8B \
+INDEX_PATH=./data/e5_Flat.index \
+CORPUS_PATH=./data/wiki-18.jsonl \
+TRAIN_DATA=./data/asearcher_searchr1/train.parquet \
+VAL_DATA=./data/asearcher_searchr1/test.parquet \
+EXPERIMENT_NAME=qwen3-4b-asearcher-opd-from-8b \
+bash train_opd.sh
+```
+
+Useful OPD overrides include:
+
+- `TEACHER_MODEL_PATH`
+- `OPD_ENABLE`
+- `OPD_KL_COEF`
+- `OPD_PURE_DISTILL`
+- `TRAIN_VISIBLE_DEVICES`
+- `RETRIEVAL_VISIBLE_DEVICES`
+- `SGLANG_VISIBLE_DEVICES`
+- `CKPTS_DIR`
+- `PROJECT_NAME`
+- `EXPERIMENT_NAME`
+
+The script keeps the OPD-specific patch sync in one place:
+
+- `src/opd/fsdp_workers.py` -> `verl/verl/workers/fsdp_workers.py`
+- `src/opd/main_ppo.py` -> `verl/verl/trainer/main_ppo.py`
+- `src/opd/ray_trainer.py` -> `verl/verl/trainer/ppo/ray_trainer.py`
+- `src/opd/utils.py` -> `verl/verl/trainer/ppo/utils.py`
+
+### 3.4 Multinode sync training
 
 Multinode entry scripts:
 
