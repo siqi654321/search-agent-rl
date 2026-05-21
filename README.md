@@ -8,11 +8,14 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - training patches and configs in `src/`
 - fully async training patches in `src/async/`
 - OPD training patches in `src/opd/`
+- mtools training patches in `src/mtools/`
 - data conversion scripts in `data/`
 - the training entry script `train.sh`
 - the fully async training entry script `train_async.sh`
 - the OPD training entry script `train_opd.sh`
+- the mtools training entry script `train_mtools.sh`
 - the BrowseComp+ evaluation entry script `browsecomp_plus_eval.sh`
+- the mtools BrowseComp+ evaluation entry script `browsecomp_plus_eval_mtools.sh`
 
 ## 1. Environment Setup
 
@@ -61,7 +64,9 @@ search-agent-rl/
 │   └── e5-base-v2/
 ├── retrieval/
 ├── src/
+├── browsecomp_plus_eval_mtools.sh
 ├── train_opd.sh
+├── train_mtools.sh
 ├── train_async.sh
 ├── train.sh
 └── browsecomp_plus_eval.sh
@@ -268,7 +273,64 @@ The script keeps the OPD-specific patch sync in one place:
 - `src/opd/ray_trainer.py` -> `verl/verl/trainer/ppo/ray_trainer.py`
 - `src/opd/utils.py` -> `verl/verl/trainer/ppo/utils.py`
 
-### 3.4 Multinode sync training
+### 3.4 Mtools training
+
+Mtools training entry point: `train_mtools.sh`
+
+The script does the following:
+
+1. starts one local SGLang summary server for tool-side summarization
+2. starts `src/mtools/retrieval_server_train.py` to provide `/search` and `/browse`
+3. syncs the shared reward / tool parser patches from `src/` into `verl/verl/`
+4. syncs the mtools-specific tool patches from `src/mtools/` into `verl/verl/`
+5. converts the base parquet data into the mtools prompt format with `src/mtools/prepare_mtool_data.py`
+6. launches GRPO training through `verl.trainer.main_ppo`
+
+Run mtools training with:
+
+```bash
+bash train_mtools.sh
+```
+
+Common override example:
+
+```bash
+SUMMARY_MODEL_PATH=./models/Qwen3-1.7B \
+ACTOR_MODEL_PATH=./models/Qwen3-4B \
+INDEX_PATH=./data/e5_Flat.index \
+CORPUS_PATH=./data/wiki-18.jsonl \
+RAW_TRAIN_DATA=./data/asearcher_searchr1/train.parquet \
+RAW_VAL_DATA=./data/asearcher_searchr1/test.parquet \
+TOOL_CONFIG=./src/mtools/mtool_config.yaml \
+EXPERIMENT_NAME=qwen3-4b-mtools-search-visit \
+bash train_mtools.sh
+```
+
+Useful mtools training overrides include:
+
+- `SUMMARY_MODEL_PATH`
+- `ACTOR_MODEL_PATH`
+- `INDEX_PATH`
+- `CORPUS_PATH`
+- `RETRIEVER_MODEL`
+- `RAW_TRAIN_DATA`
+- `RAW_VAL_DATA`
+- `TRAIN_DATA`
+- `VAL_DATA`
+- `TOOL_CONFIG`
+- `TRAIN_VISIBLE_DEVICES`
+- `RETRIEVER_VISIBLE_DEVICES`
+- `SUMMARY_VISIBLE_DEVICES`
+- `PROJECT_NAME`
+- `EXPERIMENT_NAME`
+
+The script keeps the mtools-specific patch sync in one place:
+
+- `src/mtools/search_r1_like_utils.py` -> `verl/verl/tools/utils/search_r1_like_utils.py`
+- `src/mtools/search_tool.py` -> `verl/verl/tools/search_tool.py`
+- `src/mtools/visit_tool.py` -> `verl/verl/tools/visit_tool.py`
+
+### 3.5 Multinode sync training
 
 Multinode entry scripts:
 
@@ -371,6 +433,49 @@ INDEX_PATH=./data/browsecomp-plus-indexes/qwen3-embedding-8b \
 QUERY_ENCODER_MODEL=./models/Qwen3-Embedding-8B \
 bash browsecomp_plus_eval.sh
 ```
+
+### 4.2 Mtools BrowseComp+ evaluation
+
+Mtools evaluation entry point: `browsecomp_plus_eval_mtools.sh`
+
+The script will:
+
+1. start three `Qwen3-1.7B` SGLang summary servers
+2. start `src/mtools/retrieval_server_browsecomp_plus.py`
+3. convert the evaluation parquet into the mtools prompt format with `src/mtools/prepare_mtool_data.py`
+4. run `verl.trainer.main_ppo` in `val_only` mode with the mtools search / visit tools enabled
+
+Run mtools evaluation with:
+
+```bash
+bash browsecomp_plus_eval_mtools.sh
+```
+
+Common override example:
+
+```bash
+BASE_MODEL_PATH=./models/Qwen3-4B \
+CHECKPOINT_PATH=./checkpoints/qwen3-4b-mtools/global_step_250 \
+INDEX_PATH=./data/browsecomp-plus-indexes/qwen3-embedding-8b \
+QUERY_ENCODER_MODEL=./models/Qwen3-Embedding-8B \
+RAW_VAL_DATA=./data/browsecompplus_searchr1/test.parquet \
+bash browsecomp_plus_eval_mtools.sh
+```
+
+Useful mtools evaluation overrides include:
+
+- `BASE_MODEL_PATH`
+- `CHECKPOINT_PATH`
+- `INDEX_PATH`
+- `CORPUS_REPO_ID`
+- `QUERY_ENCODER_MODEL`
+- `RAW_VAL_DATA`
+- `VAL_DATA`
+- `TOOL_CONFIG`
+- `VALIDATION_DATA_DIR`
+- `SUMMARY_BASE_URLS`
+- `RETRIEVER_VISIBLE_DEVICES`
+- `EVAL_VISIBLE_DEVICES`
 
 ## 5. Notes
 

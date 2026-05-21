@@ -1,0 +1,52 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      type: native
+      retrieval_service_url: http://127.0.0.1:1249/search
+      topk: 10
+      timeout: 600
+      num_workers: 64
+      rate_limit: 64
+      enable_global_rate_limit: true
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Perform local corpus searches and return top search results. Accepts multiple queries.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: array
+              description: The list of search queries.
+          required:
+            - query
+
+  - class_name: verl.tools.visit_tool.VisitTool
+    config:
+      type: native
+      browser_service_url: http://127.0.0.1:1249/browse
+      timeout: 600
+      summarize: true
+      max_doc_chars: 4000
+      num_workers: 64
+      rate_limit: 64
+      enable_global_rate_limit: true
+    tool_schema:
+      type: function
+      function:
+        name: visit
+        description: Visit local webpage/document(s) and return content relevant to the goal.
+        parameters:
+          type: object
+          properties:
+            url:
+              type: array
+              description: The URL(s), doc:// document id(s), or raw document id(s) to visit.
+            goal:
+              type: string
+              description: The specific information goal for visiting webpage(s).
+          required:
+            - url
+            - goal
+
