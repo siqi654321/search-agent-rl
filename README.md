@@ -9,6 +9,7 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - fully async training patches in `src/async/`
 - OPD training patches in `src/opd/`
 - mtools training patches in `src/mtools/`
+- Qwen3.5 main-agent evaluation patches and tool configs in `main_agent_eval/`
 - data conversion scripts in `data/`
 - the training entry script `train.sh`
 - the fully async training entry script `train_async.sh`
@@ -16,6 +17,7 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - the mtools training entry script `train_mtools.sh`
 - the BrowseComp+ evaluation entry script `browsecomp_plus_eval.sh`
 - the mtools BrowseComp+ evaluation entry script `browsecomp_plus_eval_mtools.sh`
+- the Qwen3.5 main-agent evaluation entry script `eval_verl_qwen35.sh`
 
 ## 1. Environment Setup
 
@@ -49,6 +51,7 @@ The scripts prefer environment variables when provided. Otherwise they default t
 
 - `models/Qwen3-1.7B`
 - `models/Qwen3-8B`
+- `models/Qwen3.5-35B-A3B`
 - `models/Qwen3-Embedding-8B`
 - `models/e5-base-v2`
 
@@ -60,10 +63,13 @@ search-agent-rl/
 ├── models/
 │   ├── Qwen3-1.7B/
 │   ├── Qwen3-8B/
+│   ├── Qwen3.5-35B-A3B/
 │   ├── Qwen3-Embedding-8B/
 │   └── e5-base-v2/
+├── main_agent_eval/
 ├── retrieval/
 ├── src/
+├── eval_verl_qwen35.sh
 ├── browsecomp_plus_eval_mtools.sh
 ├── train_opd.sh
 ├── train_mtools.sh
@@ -410,6 +416,8 @@ Useful multinode overrides include:
 
 ## 4. Evaluation
 
+### 4.1 Standard BrowseComp+ evaluation
+
 BrowseComp+ evaluation entry point: `browsecomp_plus_eval.sh`
 
 The script will:
@@ -476,6 +484,69 @@ Useful mtools evaluation overrides include:
 - `SUMMARY_BASE_URLS`
 - `RETRIEVER_VISIBLE_DEVICES`
 - `EVAL_VISIBLE_DEVICES`
+
+### 4.3 Qwen3.5 main-agent BrowseComp+ evaluation
+
+Qwen3.5 main-agent evaluation entry point: `eval_verl_qwen35.sh`
+
+This workflow uses the repository-local files in `main_agent_eval/` and does not
+depend on external source trees. The script:
+
+1. starts `main_agent_eval/retrieval_server.py` with global search ranking and the stateful browser endpoints
+2. uses `main_agent_eval/browsecomp_tool_config.yaml` to expose the native `search`, `open`, and `find` tools
+3. copies the main-agent patches from `main_agent_eval/` into the corresponding `verl/verl/` package locations
+4. converts the evaluation parquet to the native Qwen3.5 tool-prompt format
+5. runs `verl.trainer.main_agent_eval` in validation-only mode
+
+The verification-checkpoint, search-frontier, answer-rescue, and soft-scaffold
+controls used by the reference run are already enabled as overridable defaults in
+the script. A normal repository-local run is therefore:
+
+```bash
+bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_open_find.out
+```
+
+The default resource locations are:
+
+- model: `models/Qwen3.5-35B-A3B`
+- query encoder: `models/Qwen3-Embedding-8B`
+- index: `data/browsecomp-plus-indexes/qwen3-embedding-8b`
+- corpus: `Tevatron/browsecomp-plus-corpus`
+- input data: `data/browsecompplus_searchr1/test.parquet`
+- generated evaluation data: `data/main_agent_eval_browsecomp_test.parquet`
+- tool config: `main_agent_eval/browsecomp_tool_config.yaml`
+- retrieval server: `main_agent_eval/retrieval_server.py`
+
+Override resource locations or runtime capacity without editing the script:
+
+```bash
+BASE_MODEL_PATH=/path/to/Qwen3.5-35B-A3B \
+QUERY_ENCODER_MODEL=/path/to/Qwen3-Embedding-8B \
+INDEX_PATH=/path/to/browsecomp-plus-index \
+CORPUS_REPO_ID=/path/to/browsecomp-plus-corpus \
+RAW_VAL_DATA=/path/to/test.parquet \
+RETRIEVER_VISIBLE_DEVICES=0,1,2,3 \
+EVAL_VISIBLE_DEVICES=2,3,4,5,6,7 \
+VALIDATION_DATA_DIR=./validation_qwen35_open_find \
+bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_open_find.out
+```
+
+Set `CHECKPOINT_PATH` to evaluate a checkpoint. Leave it unset to evaluate the
+base model directly. Additional useful overrides include:
+
+- `TOPK`
+- `SEARCH_OUTPUT_TOPK`
+- `SEARCH_RICH_TOPK`
+- `SEARCH_RICH_BUDGET_CHARS`
+- `SEARCH_COMPACT_SNIPPET_CHARS`
+- `SEARCH_MAX_OUTPUT_CHARS`
+- `MAX_TOOL_RESPONSE_LENGTH`
+- `MAX_PARALLEL_CALLS`
+- `AGENT_NUM_WORKERS`
+- `TOOL_CONFIG`
+- `RETRIEVAL_SERVER_SCRIPT`
+- `PROJECT_NAME`
+- `EXPERIMENT_NAME`
 
 ## 5. Notes
 

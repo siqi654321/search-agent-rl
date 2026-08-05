@@ -1,0 +1,87 @@
+tools:
+  - class_name: verl.tools.search_tool.SearchTool
+    config:
+      retrieval_service_url: http://127.0.0.1:1249/search
+      topk: 10
+      num_workers: 64
+      rate_limit: 64
+      timeout: 600
+      enable_global_rate_limit: true
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: Search the local corpus. Use concise, discriminative queries. Results include stable OpenURL doc:// cursors; open promising documents instead of repeatedly rephrasing the same search.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: array
+              items:
+                type: string
+              description: One or more complete search query strings. Multiple queries run together and are globally deduplicated.
+          required:
+            - query
+
+  - class_name: verl.tools.corpus_browser_tool.CorpusBrowserTool
+    config:
+      browser_service_url: http://127.0.0.1:1249
+      num_workers: 64
+      rate_limit: 64
+      timeout: 600
+      enable_global_rate_limit: true
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: open
+        description: Open a stable doc:// document cursor and return deterministic numbered source lines. Use loc to read another window. If loc is omitted, goal can position the first window near query-relevant text.
+        parameters:
+          type: object
+          properties:
+            url:
+              type: string
+              description: The exact OpenURL doc:// cursor copied from a search result.
+            loc:
+              type: integer
+              description: Optional zero-based source line at which to start reading.
+            num_lines:
+              type: integer
+              description: Optional number of source lines to return; use a focused window.
+            goal:
+              type: string
+              description: Optional evidence goal used to position the initial window when loc is omitted.
+          required:
+            - url
+
+  - class_name: verl.tools.corpus_browser_tool.CorpusBrowserTool
+    config:
+      browser_service_url: http://127.0.0.1:1249
+      num_workers: 64
+      rate_limit: 64
+      timeout: 600
+      enable_global_rate_limit: true
+      type: native
+    tool_schema:
+      type: function
+      function:
+        name: find
+        description: Find an exact name, year, or phrase inside an opened document and return matching source line numbers. Then use open near a hit line for wider context.
+        parameters:
+          type: object
+          properties:
+            cursor:
+              type: string
+              description: The doc:// cursor shown by open. If omitted, the runtime reuses the most recently opened cursor.
+            pattern:
+              type: string
+              description: A short exact name, year, or phrase to locate case-insensitively.
+            context_lines:
+              type: integer
+              description: Optional number of neighboring lines around each match.
+            max_hits:
+              type: integer
+              description: Optional maximum number of matches to return.
+          required:
+            - pattern
