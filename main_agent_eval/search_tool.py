@@ -84,6 +84,28 @@ def _extract_original_user_question(agent_data: Any) -> str:
     return candidates[-1] if candidates else ""
 
 
+def _extract_current_turn_reasoning(agent_data: Any, max_chars: int) -> str:
+    """Return only the assistant reasoning that immediately preceded this tool call."""
+
+    text = str(
+        getattr(agent_data, "current_assistant_content", "")
+        or getattr(agent_data, "context_reset_latest_assistant", "")
+        or ""
+    ).strip()
+    think_open = text.lower().rfind("<think>")
+    if think_open >= 0:
+        text = text[think_open + len("<think>") :]
+    think_close = text.lower().rfind("</think>")
+    if think_close >= 0:
+        text = text[:think_close]
+    text = re.sub(r"<\|im_(?:start|end)\|>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*assistant\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
 def _question_clauses(question: str, max_clauses: int) -> list[str]:
     q = re.sub(r"\s+", " ", str(question or "")).strip()
     if not q:
@@ -250,8 +272,12 @@ class SearchTool(BaseTool):
         self._instance_dict = {}
 
         # Worker and rate limiting configuration
-        self.num_workers = config.get("num_workers", 120)
-        self.rate_limit = config.get("rate_limit", 120)
+        self.num_workers = int(
+            os.getenv("BROWSECOMP_SEARCH_NUM_WORKERS", config.get("num_workers", 120))
+        )
+        self.rate_limit = int(
+            os.getenv("BROWSECOMP_SEARCH_RATE_LIMIT", config.get("rate_limit", 120))
+        )
         self.timeout = config.get("timeout", 30)
 
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
@@ -342,6 +368,21 @@ class SearchTool(BaseTool):
                 os.getenv(
                     "VERL_TOOL_AGENT_SEARCH_FRONTIER_EXCLUDE_LIMIT",
                     config.get("search_frontier_exclude_limit", 1000),
+                )
+            ),
+        )
+        self.dual_retrieval_enabled = _truthy(
+            os.getenv(
+                "BROWSECOMP_DUAL_RETRIEVAL_ENABLE",
+                config.get("dual_retrieval_enable", "0"),
+            )
+        )
+        self.dual_reasoning_max_chars = max(
+            0,
+            int(
+                os.getenv(
+                    "BROWSECOMP_DUAL_REASONING_MAX_CHARS",
+                    config.get("dual_reasoning_max_chars", 8000),
                 )
             ),
         )
@@ -492,6 +533,11 @@ class SearchTool(BaseTool):
             return ToolResponse(text=json.dumps({"result": error_msg})), 0.0, {}
         normalized_queries = self._expand_queries(normalized_queries, kwargs.get("agent_data"))
         frontier_request_options = self._frontier_request_options(kwargs.get("agent_data"))
+        if self.dual_retrieval_enabled:
+            frontier_request_options["reasoning"] = _extract_current_turn_reasoning(
+                kwargs.get("agent_data"),
+                self.dual_reasoning_max_chars,
+            )
 
         # Execute search using Ray execution pool
         try:
@@ -525,6 +571,11 @@ class SearchTool(BaseTool):
                 if isinstance(api_response, dict) and isinstance(api_response.get("frontier"), dict)
                 else {}
             )
+            fusion_metadata = (
+                api_response.get("fusion", {})
+                if isinstance(api_response, dict) and isinstance(api_response.get("fusion"), dict)
+                else {}
+            )
             metrics = {
                 "query_count": metadata.get("query_count", 0),
                 "status": metadata.get("status", "unknown"),
@@ -543,6 +594,18 @@ class SearchTool(BaseTool):
                 ),
                 "search_frontier_selected_original_ranks": list(
                     frontier_metadata.get("selected_original_ranks", []) or []
+                ),
+                "dual_retrieval_enabled": bool(fusion_metadata.get("enabled", False)),
+                "dual_retrieval_applied": bool(fusion_metadata.get("applied", False)),
+                "dual_retrieval_fallback_error": fusion_metadata.get("fallback_error"),
+                "dual_retrieval_primary_candidates": int(
+                    fusion_metadata.get("primary_candidates", 0)
+                ),
+                "dual_retrieval_secondary_candidates": int(
+                    fusion_metadata.get("secondary_candidates", 0)
+                ),
+                "dual_retrieval_fused_candidates": int(
+                    fusion_metadata.get("fused_candidates", 0)
                 ),
             }
 

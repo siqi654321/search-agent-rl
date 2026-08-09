@@ -18,6 +18,7 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - the BrowseComp+ evaluation entry script `browsecomp_plus_eval.sh`
 - the mtools BrowseComp+ evaluation entry script `browsecomp_plus_eval_mtools.sh`
 - the Qwen3.5 main-agent evaluation entry script `eval_verl_qwen35.sh`
+- the Qwen3.5 multi-trajectory aggregation entry script `aggregate_verl_qwen35.sh`
 
 ## 1. Environment Setup
 
@@ -65,11 +66,13 @@ search-agent-rl/
 │   ├── Qwen3-8B/
 │   ├── Qwen3.5-35B-A3B/
 │   ├── Qwen3-Embedding-8B/
+│   ├── AgentIR-4B/
 │   └── e5-base-v2/
 ├── main_agent_eval/
 ├── retrieval/
 ├── src/
 ├── eval_verl_qwen35.sh
+├── aggregate_verl_qwen35.sh
 ├── browsecomp_plus_eval_mtools.sh
 ├── train_opd.sh
 ├── train_mtools.sh
@@ -492,30 +495,53 @@ Qwen3.5 main-agent evaluation entry point: `eval_verl_qwen35.sh`
 This workflow uses the repository-local files in `main_agent_eval/` and does not
 depend on external source trees. The script:
 
-1. starts `main_agent_eval/retrieval_server.py` with global search ranking and the stateful browser endpoints
-2. uses `main_agent_eval/browsecomp_tool_config.yaml` to expose the native `search`, `open`, and `find` tools
-3. copies the main-agent patches from `main_agent_eval/` into the corresponding `verl/verl/` package locations
-4. converts the evaluation parquet to the native Qwen3.5 tool-prompt format
-5. runs `verl.trainer.main_agent_eval` in validation-only mode
+1. starts a primary BrowseComp+ retriever and a reasoning-aware secondary retriever from `main_agent_eval/retrieval_server.py`
+2. fuses both rankings with weighted reciprocal-rank fusion
+3. uses `main_agent_eval/browsecomp_tool_config.yaml` to expose the native `search`, `open`, and `find` tools
+4. copies the main-agent patches from `main_agent_eval/` into the corresponding `verl/verl/` package locations
+5. converts the evaluation parquet to the native Qwen3.5 tool-prompt format
+6. runs one seeded trajectory through `verl.trainer.main_agent_eval` in validation-only mode
 
-The verification-checkpoint, search-frontier, answer-rescue, and soft-scaffold
-controls used by the reference run are already enabled as overridable defaults in
-the script. A normal repository-local run is therefore:
-
-```bash
-bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_open_find.out
-```
+The reference setup enables search-frontier and generic-answer rescue while
+disabling scaffold-v2, verification checkpoint, context reset, evidence-state
+rebuild, frontier-open-first, candidate workspace, and PI navigation. These are
+overridable environment defaults in the script.
 
 The default resource locations are:
 
-- model: `models/Qwen3.5-35B-A3B`
-- query encoder: `models/Qwen3-Embedding-8B`
-- index: `data/browsecomp-plus-indexes/qwen3-embedding-8b`
+- evaluation model: `models/Qwen3.5-35B-A3B`
+- primary query encoder: `models/Qwen3-Embedding-8B`
+- primary index: `data/browsecomp-plus-indexes/qwen3-embedding-8b`
+- secondary query encoder: `models/AgentIR-4B`
+- secondary index: `data/agentir/AgentIR_browsecomp-plus`
 - corpus: `Tevatron/browsecomp-plus-corpus`
 - input data: `data/browsecompplus_searchr1/test.parquet`
 - generated evaluation data: `data/main_agent_eval_browsecomp_test.parquet`
 - tool config: `main_agent_eval/browsecomp_tool_config.yaml`
 - retrieval server: `main_agent_eval/retrieval_server.py`
+
+Run one trajectory with a specific seed:
+
+```bash
+EVAL_SEED=2026 \
+VALIDATION_DATA_DIR="$PWD/validation_main_agent_qwen35_dual_seed2026" \
+bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_dual_seed2026.out
+```
+
+To produce the four inputs for aggregation on one machine, run the seeds
+sequentially. The retrieval services are reused after the first run:
+
+```bash
+for seed in 2026 2027 2028 2029; do
+  EVAL_SEED="$seed" \
+  VALIDATION_DATA_DIR="$PWD/validation_main_agent_qwen35_dual_seed${seed}" \
+  bash eval_verl_qwen35.sh 2>&1 | tee "eval_qwen35_dual_seed${seed}.out"
+done
+```
+
+Run seeds in parallel only when each process has isolated evaluator GPUs and
+retrieval ports, or when all processes intentionally share already-running
+retrieval services.
 
 Override resource locations or runtime capacity without editing the script:
 
@@ -523,12 +549,17 @@ Override resource locations or runtime capacity without editing the script:
 BASE_MODEL_PATH=/path/to/Qwen3.5-35B-A3B \
 QUERY_ENCODER_MODEL=/path/to/Qwen3-Embedding-8B \
 INDEX_PATH=/path/to/browsecomp-plus-index \
+AGENTIR_QUERY_ENCODER_MODEL=/path/to/AgentIR-4B \
+AGENTIR_INDEX_PATH=/path/to/agentir-browsecomp-plus-index \
 CORPUS_REPO_ID=/path/to/browsecomp-plus-corpus \
 RAW_VAL_DATA=/path/to/test.parquet \
 RETRIEVER_VISIBLE_DEVICES=0,1,2,3 \
+AGENTIR_RETRIEVER_VISIBLE_DEVICES=0,1,2,3 \
 EVAL_VISIBLE_DEVICES=2,3,4,5,6,7 \
-VALIDATION_DATA_DIR=./validation_qwen35_open_find \
-bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_open_find.out
+N_GPUS_PER_NODE=6 \
+EVAL_SEED=2029 \
+VALIDATION_DATA_DIR=./validation_main_agent_qwen35_dual_seed2029 \
+bash eval_verl_qwen35.sh 2>&1 | tee eval_qwen35_dual_seed2029.out
 ```
 
 Set `CHECKPOINT_PATH` to evaluate a checkpoint. Leave it unset to evaluate the
@@ -543,10 +574,71 @@ base model directly. Additional useful overrides include:
 - `MAX_TOOL_RESPONSE_LENGTH`
 - `MAX_PARALLEL_CALLS`
 - `AGENT_NUM_WORKERS`
+- `DUAL_SEARCH_RATE_LIMIT`
+- `DUAL_RETRIEVAL_CANDIDATE_TOPK`
+- `DUAL_RETRIEVAL_RRF_K`
+- `DUAL_RETRIEVAL_PRIMARY_WEIGHT`
+- `DUAL_RETRIEVAL_SECONDARY_WEIGHT`
+- `DUAL_REASONING_MAX_CHARS`
 - `TOOL_CONFIG`
 - `RETRIEVAL_SERVER_SCRIPT`
+- `SEARCH_TOOL_SOURCE`
+- `TOOL_AGENT_LOOP_SOURCE`
 - `PROJECT_NAME`
 - `EXPERIMENT_NAME`
+
+### 4.4 Qwen3.5 multi-trajectory aggregation
+
+Aggregation entry point: `aggregate_verl_qwen35.sh`
+
+After the four seeded runs have produced `0.jsonl`, the aggregation workflow:
+
+1. aligns the trajectories and groups identical normalized answers
+2. creates target-blind candidate records containing only the question, proposed answers, run status, and trajectory-visible evidence
+3. starts or reuses an OpenAI-compatible SGLang server for the aggregation model
+4. asks the model to choose an existing candidate without synthesizing a new answer
+5. loads targets only in the final evaluation stage and reports every single trajectory, the four-trajectory oracle, and the aggregate score
+
+The aggregation implementation is
+`main_agent_eval/evaluate_multitrajectory.py`. It uses the BrowseComp evaluation
+helpers already installed under the target VERL checkout's `scripts/` directory:
+
+- `evaluate_browsecomp_answer_verifier.py`
+- `evaluate_browsecomp_candidate_selector.py`
+- `evaluate_browsecomp_multitrajectory.py`
+
+With the default seed output directories and aggregation model location, run:
+
+```bash
+bash aggregate_verl_qwen35.sh 2>&1 | tee aggregate_qwen35_k4.out
+```
+
+The default artifacts are written under `multitrajectory/`:
+
+- `browsecomp_qwen35_k4.input.jsonl`
+- `browsecomp_qwen35_k4.predictions.jsonl`
+- `browsecomp_qwen35_k4.report.json`
+- `browsecomp_qwen35_k4.server.out`
+
+Override the model, GPUs, endpoint, or trajectory locations without editing the
+scripts:
+
+```bash
+AGG_MODEL=/path/to/Qwen3.5-35B-A3B \
+AGG_VISIBLE_DEVICES=0,1 \
+AGG_TENSOR_PARALLEL_SIZE=2 \
+AGG_PORT=30010 \
+TRAJECTORY_2026=/path/to/seed2026/0.jsonl \
+TRAJECTORY_2027=/path/to/seed2027/0.jsonl \
+TRAJECTORY_2028=/path/to/seed2028/0.jsonl \
+TRAJECTORY_2029=/path/to/seed2029/0.jsonl \
+bash aggregate_verl_qwen35.sh 2>&1 | tee aggregate_qwen35_k4.out
+```
+
+To use an aggregation server that is already running, set
+`START_AGGREGATOR_SERVER=0` and provide `AGG_ENDPOINT` and `AGG_MODEL`. The
+Python runner resumes an existing predictions file and only submits unfinished
+rows; choose a different `RUN_NAME` or output paths for a clean rerun.
 
 ## 5. Notes
 

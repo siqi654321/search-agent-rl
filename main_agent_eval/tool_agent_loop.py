@@ -322,6 +322,9 @@ class AgentData:
 
         # Temporary state for tool calls
         self.tool_calls: list[FunctionCall] = []
+        # Read-only handoff for reasoning-aware retrieval.  This does not alter
+        # prompt construction or any controller/finalization state.
+        self.current_assistant_content = ""
         self.executed_tool_call_keys: set[str] = set()
         self.duplicate_tool_calls = 0
         self.duplicate_only_streak = 0
@@ -923,6 +926,7 @@ class ToolAgentLoop(AgentLoopBase):
         # answer is distinguishable from a max-turn response containing only
         # reasoning text.
         response_content, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        agent_data.current_assistant_content = str(response_content or "")
 
         if agent_data.verification_checkpoint_pending:
             self._record_verification_checkpoint_response(
@@ -2230,6 +2234,24 @@ class ToolAgentLoop(AgentLoopBase):
                 "selected_docids": selected_docids,
                 "selected_original_ranks": list(
                     tool_metadata.get("search_frontier_selected_original_ranks") or []
+                ),
+                "dual_retrieval_enabled": bool(
+                    tool_metadata.get("dual_retrieval_enabled", False)
+                ),
+                "dual_retrieval_applied": bool(
+                    tool_metadata.get("dual_retrieval_applied", False)
+                ),
+                "dual_retrieval_fallback_error": tool_metadata.get(
+                    "dual_retrieval_fallback_error"
+                ),
+                "dual_primary_candidates": int(
+                    tool_metadata.get("dual_retrieval_primary_candidates", 0)
+                ),
+                "dual_secondary_candidates": int(
+                    tool_metadata.get("dual_retrieval_secondary_candidates", 0)
+                ),
+                "dual_fused_candidates": int(
+                    tool_metadata.get("dual_retrieval_fused_candidates", 0)
                 ),
             }
         )

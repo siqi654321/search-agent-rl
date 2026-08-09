@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone BrowseComp-Plus retrieval server with resilient result handling.
+"""Standalone BrowseComp-Plus retrieval server with resilient summarization and safer short-title handling.
 
 这个版本专门解决两个问题：
 - summarize 偶发 400/502：失败时自动缩短 `max_doc_chars` 重试，最后降级成 extractive summary；
@@ -83,6 +83,14 @@ try:
     from sentence_transformers import SentenceTransformer  # type: ignore
 except Exception:  # pragma: no cover
     SentenceTransformer = None
+
+try:
+    import torch  # type: ignore
+    from transformers import AutoModel, AutoTokenizer  # type: ignore
+except Exception:  # pragma: no cover
+    torch = None
+    AutoModel = None
+    AutoTokenizer = None
 
 
 def _require(dep, name: str):
@@ -220,14 +228,45 @@ class BrowseCompCorpus:
 
 
 class QueryEncoder:
-    def __init__(self, model_name_or_path: str, batch_size: int = 32, query_instruction: Optional[str] = None):
-        _require(SentenceTransformer, "sentence-transformers")
+    def __init__(
+        self,
+        model_name_or_path: str,
+        batch_size: int = 32,
+        query_instruction: Optional[str] = None,
+        backend: str = "sentence_transformers",
+        max_length: int = 8192,
+    ):
         _require(np, "numpy")
-        self.model = SentenceTransformer(model_name_or_path)
         self.batch_size = batch_size
         self.query_instruction = query_instruction
+        self.backend = backend
+        self.max_length = max(1, int(max_length))
+        self.tokenizer = None
+
+        if backend == "sentence_transformers":
+            _require(SentenceTransformer, "sentence-transformers")
+            self.model = SentenceTransformer(model_name_or_path)
+        elif backend == "transformer_eos":
+            _require(torch, "torch")
+            _require(AutoModel, "transformers")
+            _require(AutoTokenizer, "transformers")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path,
+                padding_side="left",
+            )
+            self.model = AutoModel.from_pretrained(
+                model_name_or_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+            )
+            self.model.eval()
+        else:
+            raise ValueError(f"Unsupported query encoder backend: {backend}")
 
     def encode_queries(self, queries: list[str]) -> "np.ndarray":
+        if self.backend == "transformer_eos":
+            return self._encode_queries_transformer_eos(queries)
+
         kwargs = {
             "batch_size": self.batch_size,
             "normalize_embeddings": True,
@@ -247,6 +286,30 @@ class QueryEncoder:
                 fallback_kwargs["prompt"] = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
             emb = self.model.encode(queries, **fallback_kwargs)
         return np.asarray(emb, dtype=np.float32)
+
+    def _encode_queries_transformer_eos(self, queries: list[str]) -> "np.ndarray":
+        """AgentIR-compatible left-padded, last-token query encoding."""
+
+        if not queries:
+            return np.empty((0, 0), dtype=np.float32)
+        prefix = self.query_instruction or ""
+        batches: list["np.ndarray"] = []
+        for start in range(0, len(queries), max(1, self.batch_size)):
+            texts = [prefix + query for query in queries[start : start + self.batch_size]]
+            encoded = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            device = self.model.device
+            encoded = {key: value.to(device) for key, value in encoded.items()}
+            with torch.no_grad():
+                hidden = self.model(**encoded, return_dict=True).last_hidden_state
+                embeddings = torch.nn.functional.normalize(hidden[:, -1], p=2, dim=-1)
+            batches.append(embeddings.float().cpu().numpy())
+        return np.asarray(np.concatenate(batches, axis=0), dtype=np.float32)
 
 
 class BaseRetriever:
@@ -314,6 +377,8 @@ class DenseRetriever(BaseRetriever):
             model_name_or_path=config.query_encoder_model,
             batch_size=config.query_encoder_batch_size,
             query_instruction=config.query_instruction,
+            backend=config.query_encoder_backend,
+            max_length=config.query_encoder_max_length,
         )
         self.index: "faiss.Index" = None  # type: ignore[assignment]
         self.lookup: list[str] = []
@@ -442,6 +507,8 @@ class Config:
         query_encoder_model: str,
         query_encoder_batch_size: int,
         query_instruction: Optional[str],
+        query_encoder_backend: str,
+        query_encoder_max_length: int,
         faiss_gpu: bool,
         max_docs: int,
     ):
@@ -456,6 +523,8 @@ class Config:
         self.query_encoder_model = query_encoder_model
         self.query_encoder_batch_size = query_encoder_batch_size
         self.query_instruction = query_instruction
+        self.query_encoder_backend = query_encoder_backend
+        self.query_encoder_max_length = query_encoder_max_length
         self.faiss_gpu = faiss_gpu
         self.max_docs = max_docs
 
@@ -724,7 +793,7 @@ def _lite_doc_url(doc: dict[str, Any]) -> str:
     docid = str(doc.get("docid") or doc.get("id") or "").strip()
     url = str(doc.get("url") or "").strip()
     # In the local BrowseComp-Plus corpus, docid is the stable address.  Keep
-    # the field name as "url" to match the visit tool schema, but expose
+    # Keep the field name as "url" to match the tool schema, but expose
     # doc:// links in search results so the model copies deterministic local
     # identifiers instead of long web URLs that later need reverse lookup.
     if docid:
@@ -1206,6 +1275,253 @@ def _format_lite_search_global_result(
     return "\n".join(header + lines).strip(), metadata
 
 
+def _rank_route_records(
+    *,
+    queries: list[str],
+    results: list[list[dict[str, Any]]],
+    scores: Optional[list[list[float]]],
+    rank_cutoff: int,
+    rerank_mode: str,
+) -> list[dict[str, Any]]:
+    records = _collect_global_search_records(
+        queries=queries,
+        results=results,
+        scores=scores,
+        rank_cutoff=rank_cutoff,
+    )
+    return sorted(
+        records.values(),
+        key=lambda rec: _global_doc_score(rec, rerank_mode),
+        reverse=True,
+    )
+
+
+def _fuse_dual_ranked_records(
+    *,
+    primary_ranked: list[dict[str, Any]],
+    secondary_docids: list[str],
+    corpus: Any,
+    output_topk: int,
+    rrf_k: int,
+    primary_weight: float,
+    secondary_weight: float,
+    queries: list[str],
+) -> list[dict[str, Any]]:
+    """Fuse route-level ranked lists using weighted reciprocal rank fusion."""
+
+    records: dict[str, dict[str, Any]] = {}
+    first_seen: dict[str, int] = {}
+    next_seen = 0
+    for rank, rec in enumerate(primary_ranked, start=1):
+        doc = rec.get("doc") or {}
+        docid = _normalize_frontier_docid(_doc_key(doc))
+        if not docid:
+            continue
+        if docid not in first_seen:
+            first_seen[docid] = next_seen
+            next_seen += 1
+        records[docid] = {
+            "doc": doc,
+            "queries": list(queries),
+            "primary_rank": rank,
+            "secondary_rank": None,
+            "fusion_score": float(primary_weight) / (max(0, int(rrf_k)) + rank),
+        }
+    for rank, raw_docid in enumerate(secondary_docids, start=1):
+        docid = _normalize_frontier_docid(raw_docid)
+        if not docid:
+            continue
+        if docid not in first_seen:
+            first_seen[docid] = next_seen
+            next_seen += 1
+        rec = records.get(docid)
+        if rec is None:
+            doc = corpus.get_doc(docid) if corpus is not None else None
+            if doc is None:
+                continue
+            rec = {
+                "doc": doc,
+                "queries": list(queries),
+                "primary_rank": None,
+                "secondary_rank": rank,
+                "fusion_score": 0.0,
+            }
+            records[docid] = rec
+        rec["secondary_rank"] = rank
+        rec["fusion_score"] = float(rec.get("fusion_score", 0.0)) + float(
+            secondary_weight
+        ) / (max(0, int(rrf_k)) + rank)
+
+    ranked = sorted(
+        records.items(),
+        key=lambda item: (
+            -float(item[1].get("fusion_score", 0.0)),
+            min(
+                int(item[1].get("primary_rank") or 10**9),
+                int(item[1].get("secondary_rank") or 10**9),
+            ),
+            first_seen[item[0]],
+            item[0],
+        ),
+    )[: max(1, int(output_topk))]
+    fused: list[dict[str, Any]] = []
+    for rank, (_, rec) in enumerate(ranked, start=1):
+        copied = dict(rec)
+        copied["rank"] = rank
+        fused.append(copied)
+    return fused
+
+
+def _format_dual_ranked_result(
+    *,
+    queries: list[str],
+    ranked: list[dict[str, Any]],
+    frontier_enable: bool,
+    frontier_exclude_docids: Optional[list[str]],
+    frontier_output_topk: int,
+    frontier_overlap_threshold: float,
+    frontier_compact_snippet_chars: Optional[int],
+) -> tuple[str, dict[str, Any]]:
+    """Render a pre-fused route ranking without reordering it a second time."""
+
+    output_topk = max(1, int(frontier_output_topk))
+    base_page = ranked[:output_topk]
+    excluded = {
+        docid
+        for value in (frontier_exclude_docids or [])
+        if (docid := _normalize_frontier_docid(value))
+    }
+    base_docids = [
+        _normalize_frontier_docid(_doc_key(rec.get("doc") or {})) for rec in base_page
+    ]
+    base_overlap = (
+        sum(docid in excluded for docid in base_docids) / len(base_docids)
+        if base_docids
+        else 0.0
+    )
+    threshold = min(1.0, max(0.0, float(frontier_overlap_threshold)))
+    frontier_applied = bool(frontier_enable and excluded and base_overlap >= threshold)
+    unseen_ranked = [
+        rec
+        for rec in ranked
+        if _normalize_frontier_docid(_doc_key(rec.get("doc") or {})) not in excluded
+    ]
+    selected = unseen_ranked[:output_topk] if frontier_applied else base_page
+    frontier_exhausted = bool(frontier_applied and not selected)
+
+    if frontier_applied:
+        header = [
+            f"A dual retrieval search for {len(queries)} query/query variants found "
+            f"{len(ranked)} fused candidate documents."
+        ]
+        if frontier_exhausted:
+            header.extend(
+                [
+                    "SEARCH_FRONTIER_EXHAUSTED",
+                    (
+                        "No unseen candidates remain in this fused search frontier. "
+                        "Open a previously returned cursor or add a genuinely new entity, relation, date, "
+                        "title, or quoted phrase to the next search."
+                    ),
+                ]
+            )
+        else:
+            header.extend(
+                [
+                    "SEARCH_FRONTIER_PAGE",
+                    (
+                        f"Returning up to {output_topk} unseen fused candidates. "
+                        f"{_search_open_instruction()} Compact candidates may be equally relevant; "
+                        "open a cursor to inspect full evidence."
+                    ),
+                    "Results:",
+                ]
+            )
+    else:
+        header = [
+            f"A dual retrieval search for {len(queries)} query/query variants found "
+            f"{len(ranked)} fused candidate documents.",
+            (
+                "Results combine the original query route with a reasoning-aware route. "
+                f"{_search_open_instruction()} Top {search_global_rich_topk} results include richer "
+                "evidence; the rest are compact candidate lines."
+            ),
+            "Results:",
+        ]
+
+    lines: list[str] = []
+    compact_chars = int(search_global_compact_snippet_chars)
+    if frontier_applied and frontier_compact_snippet_chars is not None:
+        compact_chars = max(0, int(frontier_compact_snippet_chars))
+    query_context = " ".join(queries)
+    for out_rank, rec in enumerate(selected, start=1):
+        doc = rec.get("doc") or {}
+        if out_rank <= int(search_global_rich_topk):
+            text = _build_source_card(
+                query=query_context,
+                doc=doc,
+                budget_chars=search_global_rich_budget,
+                mode=search_global_rich_mode,
+            )
+        else:
+            text = _build_compact_search_line(
+                query=query_context,
+                doc=doc,
+                mode=search_global_compact_mode,
+                snippet_chars=compact_chars,
+            )
+        line = f"{out_rank}. {text}".strip()
+        current = "\n".join(header + lines)
+        if (
+            search_global_max_output_chars > 0
+            and len(current) + len(line) + 2 > int(search_global_max_output_chars)
+        ):
+            break
+        lines.append(line)
+
+    selected_records = selected[: len(lines)]
+    metadata = {
+        "enabled": bool(frontier_enable),
+        "applied": frontier_applied,
+        "exhausted": frontier_exhausted,
+        "base_overlap": base_overlap,
+        "base_rank_cutoff": output_topk,
+        "full_rank_cutoff": len(ranked),
+        "base_candidate_count": min(output_topk, len(ranked)),
+        "candidate_count": len(ranked),
+        "full_unique_candidate_count": len(ranked),
+        "unseen_count": len(unseen_ranked),
+        "excluded_count": len(excluded),
+        "selected_count": len(selected_records),
+        "selected_docids": [
+            _normalize_frontier_docid(_doc_key(rec.get("doc") or {}))
+            for rec in selected_records
+        ],
+        "selected_original_ranks": [int(rec.get("rank", 0)) for rec in selected_records],
+        "dual_retrieval": True,
+    }
+    return "\n".join(header + lines).strip(), metadata
+
+
+def _secondary_ranked_docids(*, queries: list[str], topk: int) -> list[str]:
+    if not dual_secondary_rank_url:
+        raise ValueError("dual_secondary_rank_url is empty")
+    response = requests.post(
+        dual_secondary_rank_url,
+        json={"queries": queries, "topk": topk, "return_scores": True},
+        timeout=dual_secondary_timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success", False):
+        raise RuntimeError(str(payload.get("error") or "secondary rank endpoint failed"))
+    return [
+        docid
+        for value in payload.get("ranked_docids", [])
+        if (docid := _normalize_frontier_docid(value))
+    ]
+
+
 def _build_externalized_visit_evidence(
     *,
     doc: dict[str, Any],
@@ -1471,7 +1787,8 @@ def _format_visit_result(raw_url: str, doc: dict[str, Any], goal: str, max_doc_c
         evidence = _truncate_text(body, max_doc_chars)
         summary = "Summarization is disabled. The relevant page content is provided in Evidence in page above."
 
-    # Keep the Evidence/Summary response contract used during training.
+    # Keep the established browser output contract so the model sees the same
+    # Evidence/Summary framing used during training and evaluation.
     return (
         f"The useful information in {raw_url} for user goal {goal} as follows: \n\n"
         f"Evidence in page: \n{evidence}\n\n"
@@ -1696,7 +2013,7 @@ class RetrieveSummarizeRequest(BaseModel):
 
 
 class LiteSearchRequest(BaseModel):
-    # The native search prompt emits {"query": [...]}, while verl's existing
+    # The search prompt emits {"query": [...]}, while verl's existing
     # SearchTool transport posts {"queries": [...]}. Accept both so this
     # endpoint can be used by the model prompt and by the verl tool wrapper.
     query: Optional[Any] = None
@@ -1710,6 +2027,14 @@ class LiteSearchRequest(BaseModel):
     frontier_candidate_topk: int = 50
     frontier_overlap_threshold: float = 0.90
     frontier_compact_snippet_chars: Optional[int] = None
+    reasoning: str = ""
+
+
+class RankSearchRequest(BaseModel):
+    query: Optional[Any] = None
+    queries: Optional[list[str]] = None
+    topk: Optional[int] = None
+    return_scores: bool = True
 
 
 class LiteBrowseRequest(BaseModel):
@@ -1772,6 +2097,14 @@ search_global_rich_mode: str = "inventory_chunks"
 search_global_compact_mode: str = "title_inventory"
 search_global_compact_snippet_chars: int = 80
 search_global_max_output_chars: int = 32000
+dual_retrieval_enable: bool = False
+dual_secondary_rank_url: str = ""
+dual_candidate_topk: int = 50
+dual_rrf_k: int = 60
+dual_primary_weight: float = 1.0
+dual_secondary_weight: float = 2.0
+dual_primary_rerank_mode: str = "rrf"
+dual_secondary_timeout: float = 120.0
 visit_externalize_enable: bool = False
 visit_externalize_budget_chars: int = 8000
 visit_externalize_mode: str = "inventory_chunks"
@@ -1810,9 +2143,57 @@ def retrieve_endpoint(request: RetrieveRequest):
     return {"result": resp}
 
 
+@app.post("/rank")
+def rank_search_endpoint(request: RankSearchRequest):
+    """Return a compact route-level ranking for a dual-retrieval gateway."""
+
+    start = time.time()
+    if retriever is None or config is None:
+        raise HTTPException(status_code=500, detail="server 未初始化（retriever/config 为空）")
+    raw_queries = request.query if request.query is not None else request.queries
+    queries = _normalize_lite_values(raw_queries or [])
+    if not queries:
+        return {
+            "success": False,
+            "ranked_docids": [],
+            "elapsed_ms": 0.0,
+            "error": "query/queries is empty",
+        }
+    try:
+        topk = max(1, int(request.topk or config.retrieval_topk))
+        results, scores = retriever.batch_search(
+            query_list=queries,
+            num=topk,
+            return_score=True,
+        )
+        ranked = _rank_route_records(
+            queries=queries,
+            results=results,
+            scores=scores,
+            rank_cutoff=topk,
+            rerank_mode=search_global_rerank_mode,
+        )[:topk]
+        return {
+            "success": True,
+            "ranked_docids": [
+                _normalize_frontier_docid(_doc_key(rec.get("doc") or {})) for rec in ranked
+            ],
+            "candidate_count": len(ranked),
+            "elapsed_ms": (time.time() - start) * 1000,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "ranked_docids": [],
+            "elapsed_ms": (time.time() - start) * 1000,
+            "error": str(exc),
+        }
+
+
 @app.post("/search")
 def search_endpoint(request: LiteSearchRequest):
-    """Local search endpoint for the research agent.
+    """Local search endpoint compatible with the configured search tool.
 
     Accepts {"query": str | list[str]} and returns a Serper-like text block
     containing titles, snippets, and doc:// identifiers that can be passed to
@@ -1827,6 +2208,76 @@ def search_endpoint(request: LiteSearchRequest):
         return {"success": False, "result": "", "elapsed_ms": 0.0, "error": "query/queries is empty"}
 
     try:
+        dual_error = ""
+        if dual_retrieval_enable and str(request.reasoning or "").strip():
+            candidate_topk = max(
+                int(dual_candidate_topk),
+                int(request.frontier_candidate_topk),
+                int(request.topk or config.retrieval_topk),
+            )
+            primary_results, primary_scores = retriever.batch_search(
+                query_list=queries,
+                num=candidate_topk,
+                return_score=True,
+            )
+            primary_ranked = _rank_route_records(
+                queries=queries,
+                results=primary_results,
+                scores=primary_scores,
+                rank_cutoff=candidate_topk,
+                rerank_mode=dual_primary_rerank_mode,
+            )[:candidate_topk]
+            reasoning = re.sub(r"\s+", " ", str(request.reasoning or "")).strip()
+            secondary_queries = [
+                f"Reasoning: {reasoning}\nQuery: {query}" for query in queries
+            ]
+            try:
+                secondary_docids = _secondary_ranked_docids(
+                    queries=secondary_queries,
+                    topk=candidate_topk,
+                )
+                fused_ranked = _fuse_dual_ranked_records(
+                    primary_ranked=primary_ranked,
+                    secondary_docids=secondary_docids,
+                    corpus=getattr(retriever, "corpus", None),
+                    output_topk=candidate_topk,
+                    rrf_k=dual_rrf_k,
+                    primary_weight=dual_primary_weight,
+                    secondary_weight=dual_secondary_weight,
+                    queries=queries,
+                )
+                result_text, frontier_metadata = _format_dual_ranked_result(
+                    queries=queries,
+                    ranked=fused_ranked,
+                    frontier_enable=bool(request.frontier_enable),
+                    frontier_exclude_docids=request.frontier_exclude_docids,
+                    frontier_output_topk=request.frontier_output_topk,
+                    frontier_overlap_threshold=request.frontier_overlap_threshold,
+                    frontier_compact_snippet_chars=request.frontier_compact_snippet_chars,
+                )
+                elapsed = (time.time() - start) * 1000
+                return {
+                    "success": True,
+                    "result": result_text,
+                    "elapsed_ms": elapsed,
+                    "error": "",
+                    "frontier": frontier_metadata,
+                    "fusion": {
+                        "enabled": True,
+                        "applied": True,
+                        "primary_candidates": len(primary_ranked),
+                        "secondary_candidates": len(secondary_docids),
+                        "fused_candidates": len(fused_ranked),
+                        "rrf_k": dual_rrf_k,
+                        "primary_weight": dual_primary_weight,
+                        "secondary_weight": dual_secondary_weight,
+                    },
+                }
+            except Exception as exc:
+                # Preserve the established 59-point route if AgentIR is down.
+                dual_error = f"{type(exc).__name__}: {exc}"
+                print(f"[dual-retrieval-fallback] {dual_error}", flush=True)
+
         topk = request.topk or config.retrieval_topk
         results, scores = retriever.batch_search(query_list=queries, num=topk, return_score=request.return_scores)
         frontier_metadata: dict[str, Any] = {
@@ -1861,6 +2312,11 @@ def search_endpoint(request: LiteSearchRequest):
             "elapsed_ms": elapsed,
             "error": "",
             "frontier": frontier_metadata,
+            "fusion": {
+                "enabled": bool(dual_retrieval_enable),
+                "applied": False,
+                "fallback_error": dual_error,
+            },
         }
     except Exception as e:
         elapsed = (time.time() - start) * 1000
@@ -1869,10 +2325,11 @@ def search_endpoint(request: LiteSearchRequest):
 
 @app.post("/browse")
 def browse_endpoint(request: LiteBrowseRequest):
-    """Local visit endpoint for the research agent.
+    """Local browse endpoint compatible with the configured open tool.
 
     Accepts {"url": str | list[str], "goal": str}. URLs may be doc://<docid>,
-    raw docids, or corpus URLs. The response uses the evaluation tool contract.
+    raw docids, or corpus URLs. The response uses the established browser
+    evidence format.
     """
     start = time.time()
     if retriever is None or config is None:
@@ -2093,6 +2550,16 @@ if __name__ == "__main__":
     parser.add_argument("--query_encoder_model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--query_encoder_batch_size", type=int, default=32)
     parser.add_argument("--query_instruction", type=str, default=None)
+    parser.add_argument(
+        "--query_encoder_backend",
+        choices=["sentence_transformers", "transformer_eos"],
+        default="sentence_transformers",
+        help=(
+            "Query embedding backend. transformer_eos uses left padding and the final token, "
+            "as required by AgentIR-4B."
+        ),
+    )
+    parser.add_argument("--query_encoder_max_length", type=int, default=8192)
     parser.add_argument("--faiss_gpu", action="store_true")
 
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -2187,6 +2654,22 @@ if __name__ == "__main__":
     parser.add_argument("--search_global_compact_snippet_chars", type=int, default=80)
     parser.add_argument("--search_global_max_output_chars", type=int, default=32000)
     parser.add_argument(
+        "--dual_retrieval_enable",
+        action="store_true",
+        help="Fuse local raw-query retrieval with a remote reasoning-aware /rank endpoint.",
+    )
+    parser.add_argument("--dual_secondary_rank_url", type=str, default="")
+    parser.add_argument("--dual_candidate_topk", type=int, default=50)
+    parser.add_argument("--dual_rrf_k", type=int, default=60)
+    parser.add_argument("--dual_primary_weight", type=float, default=1.0)
+    parser.add_argument("--dual_secondary_weight", type=float, default=2.0)
+    parser.add_argument(
+        "--dual_primary_rerank_mode",
+        choices=["rrf", "min_rank", "rrf_lexical"],
+        default="rrf",
+    )
+    parser.add_argument("--dual_secondary_timeout", type=float, default=120.0)
+    parser.add_argument(
         "--search_result_link_label",
         choices=["VisitURL", "OpenURL"],
         default="VisitURL",
@@ -2262,6 +2745,8 @@ if __name__ == "__main__":
         query_encoder_model=args.query_encoder_model,
         query_encoder_batch_size=args.query_encoder_batch_size,
         query_instruction=args.query_instruction,
+        query_encoder_backend=args.query_encoder_backend,
+        query_encoder_max_length=args.query_encoder_max_length,
         faiss_gpu=args.faiss_gpu,
         max_docs=args.max_docs,
     )
@@ -2298,6 +2783,16 @@ if __name__ == "__main__":
     search_global_compact_mode = args.search_global_compact_mode
     search_global_compact_snippet_chars = int(args.search_global_compact_snippet_chars)
     search_global_max_output_chars = int(args.search_global_max_output_chars)
+    dual_retrieval_enable = bool(args.dual_retrieval_enable)
+    dual_secondary_rank_url = str(args.dual_secondary_rank_url or "").strip()
+    dual_candidate_topk = max(1, int(args.dual_candidate_topk))
+    dual_rrf_k = max(0, int(args.dual_rrf_k))
+    dual_primary_weight = max(0.0, float(args.dual_primary_weight))
+    dual_secondary_weight = max(0.0, float(args.dual_secondary_weight))
+    dual_primary_rerank_mode = args.dual_primary_rerank_mode
+    dual_secondary_timeout = max(1.0, float(args.dual_secondary_timeout))
+    if dual_retrieval_enable and not dual_secondary_rank_url:
+        parser.error("--dual_retrieval_enable requires --dual_secondary_rank_url")
     search_result_link_label = args.search_result_link_label
     search_result_open_tool_name = args.search_result_open_tool_name
     browser_line_chars = max(40, int(args.browser_line_chars))
