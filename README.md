@@ -19,6 +19,9 @@ This repository builds a search-centric RL workflow on top of the `verl` submodu
 - the mtools BrowseComp+ evaluation entry script `browsecomp_plus_eval_mtools.sh`
 - the Qwen3.5 main-agent evaluation entry script `eval_verl_qwen35.sh`
 - the Qwen3.5 multi-trajectory aggregation entry script `aggregate_verl_qwen35.sh`
+- the Qwen3.5-4B data entry script `prepare_qwen35_4b_data.sh`
+- the Qwen3.5-4B training entry script `train_qwen35_4b.sh`
+- the Qwen3.5-4B evaluation entry script `eval_qwen35_4b.sh`
 
 ## 1. Environment Setup
 
@@ -67,10 +70,15 @@ search-agent-rl/
 │   ├── Qwen3.5-35B-A3B/
 │   ├── Qwen3-Embedding-8B/
 │   ├── AgentIR-4B/
+│   ├── Qwen3.5-4B/
 │   └── e5-base-v2/
 ├── main_agent_eval/
+├── qwen35_4b/
 ├── retrieval/
 ├── src/
+├── prepare_qwen35_4b_data.sh
+├── train_qwen35_4b.sh
+├── eval_qwen35_4b.sh
 ├── eval_verl_qwen35.sh
 ├── aggregate_verl_qwen35.sh
 ├── browsecomp_plus_eval_mtools.sh
@@ -147,6 +155,72 @@ export INDEX_PATH=/path/to/browsecomp-index
 export CORPUS_REPO_ID=/path/to/local-corpus-or-hf-repo-id
 export QUERY_ENCODER_MODEL=/path/to/Qwen3-Embedding-8B
 ```
+
+### 2.5 Qwen3.5-4B synthetic training data
+
+Qwen3.5-4B data entry point: `prepare_qwen35_4b_data.sh`
+
+The implementation is under `qwen35_4b/`. It builds two training datasets:
+
+- a causal SFT dataset from protected `n=4` base-model trajectories, supervising selected tool calls, corrected actions, final answers, and turn boundaries rather than entire trajectories
+- a GRPO question pool built from contamination-filtered corpus documents, multi-hop chains, Qwen3.5-35B-A3B question generation, semantic filtering, `n=8` rollout audits, and evidence/length-based core selection
+
+The default outputs are repository-relative:
+
+- `data/qwen35_4b/sft.parquet`
+- `data/qwen35_4b/qa/clean/questions.parquet`
+- `data/qwen35_4b/rl.parquet`
+- data-stage receipts under `data/qwen35_4b/state/`
+- service and data logs under `outputs/qwen35_4b/`
+
+Export the resource locations once before starting the workflow. The values
+below are placeholders; do not write machine-specific locations into tracked
+files:
+
+```bash
+export BASE_MODEL=/path/to/Qwen3.5-4B
+export RAW_SFT_DATA=/path/to/asearcher/train.parquet
+export WIKI_CORPUS=/path/to/wiki-18.jsonl
+export WIKI_INDEX=/path/to/e5_Flat.index
+export WIKI_ENCODER=/path/to/e5-base-v2
+
+export TEACHER_MODEL=/path/to/Qwen3.5-35B-A3B
+export CORPUS=/path/to/browsecomp-plus-corpus
+export SEARCH_INDEX=/path/to/browsecomp-plus-index
+export SEARCH_ENCODER=/path/to/Qwen3-Embedding-8B
+export REASONING_INDEX=/path/to/agentir-browsecomp-plus-index
+export REASONING_ENCODER=/path/to/AgentIR-4B
+
+export BENCHMARK_JSONL=/path/to/benchmark.jsonl
+export QREL_GOLDS=/path/to/qrel-golds.txt
+export QREL_EVIDENCE=/path/to/qrel-evidence.txt
+```
+
+First build the causal SFT data:
+
+```bash
+bash prepare_qwen35_4b_data.sh sft 2>&1 | tee qwen35_4b_sft_data.out
+```
+
+After completing SFT training as described in section 3.6, build the synthetic
+QA pool, generate trajectories, and select the GRPO pool:
+
+```bash
+bash prepare_qwen35_4b_data.sh qa 2>&1 | tee qwen35_4b_qa.out
+bash prepare_qwen35_4b_data.sh rollout 2>&1 | tee qwen35_4b_rollout.out
+bash prepare_qwen35_4b_data.sh select 2>&1 | tee qwen35_4b_select.out
+```
+
+Rollout can be resumed one complete batch at a time, for example:
+
+```bash
+bash prepare_qwen35_4b_data.sh rollout 2
+```
+
+Completed stages are reused only when their input, code, recipe, and output
+receipts still match. An interrupted rollout batch is retained separately and
+rerun as a whole; trajectories from partial attempts are never appended to a
+new batch.
 
 ## 3. Training
 
@@ -417,6 +491,57 @@ Useful multinode overrides include:
 - `CKPTS_DIR`
 - `RESUME_FROM_PATH`
 
+### 3.6 Qwen3.5-4B causal SFT and GRPO
+
+Qwen3.5-4B training entry point: `train_qwen35_4b.sh`
+
+Both training stages require eight GPUs. The entry script verifies that the
+`verl/` submodule is at the pinned compatible revision and installs the 18
+complete runtime files from `qwen35_4b/files/` into matching locations inside
+the submodule. It refuses conflicting local modifications and does not reset
+the repository.
+
+After generating `data/qwen35_4b/sft.parquet`, run causal SFT:
+
+```bash
+TRAIN_GPUS=0,1,2,3,4,5,6,7 \
+bash train_qwen35_4b.sh sft 2>&1 | tee qwen35_4b_sft.out
+```
+
+The fixed SFT recipe trains for 112 steps, saves every 28 steps, and uses
+sequence parallelism 4. The subsequent rollout and GRPO stages use the step-28
+Hugging Face checkpoint by default:
+
+```text
+outputs/qwen35_4b/sft/global_step_28/huggingface/
+```
+
+Once the QA rollout and selection stages from section 2.5 have produced
+`data/qwen35_4b/rl.parquet`, start GRPO:
+
+```bash
+TRAIN_GPUS=0,1,2,3,4,5,6,7 \
+RETRIEVAL_GPUS=0,1,2,3 \
+bash train_qwen35_4b.sh rl 2>&1 | tee qwen35_4b_rl.out
+```
+
+The GRPO recipe initializes from SFT step 28, samples eight trajectories per
+question, trains for 20 steps, and retains checkpoints 5, 10, 15, and 20 under
+`outputs/qwen35_4b/rl/`. Dual retrieval combines the normal query route and the
+reasoning-aware route with configurable corpus, index, encoder, GPU, and port
+locations from `qwen35_4b/config.env` or environment variables.
+
+The end-to-end order is therefore:
+
+```text
+prepare sft -> train sft -> prepare qa -> prepare rollout -> prepare select -> train rl -> prepare eval -> eval
+```
+
+Use `DRY_RUN=1` with either entry script to validate paths and print the fixed
+commands without starting services or GPU jobs. Use a new `DATA_ROOT` after
+changing data-generation code, and a new `RUN_ROOT` when retraining so existing
+datasets and checkpoints are not overwritten.
+
 ## 4. Evaluation
 
 ### 4.1 Standard BrowseComp+ evaluation
@@ -639,6 +764,69 @@ To use an aggregation server that is already running, set
 `START_AGGREGATOR_SERVER=0` and provide `AGG_ENDPOINT` and `AGG_MODEL`. The
 Python runner resumes an existing predictions file and only submits unfinished
 rows; choose a different `RUN_NAME` or output paths for a clean rerun.
+
+### 4.5 Qwen3.5-4B checkpoint evaluation
+
+Qwen3.5-4B evaluation entry point: `eval_qwen35_4b.sh`
+
+First convert the 830-question BrowseComp+ parquet to the same native
+`search`/`open`/`find` prompt format used by the training recipe:
+
+```bash
+RAW_EVAL_DATA=/path/to/browsecomp-plus/test.parquet \
+bash prepare_qwen35_4b_data.sh eval 2>&1 | tee qwen35_4b_eval_data.out
+```
+
+This writes `data/qwen35_4b/eval.parquet` by default. Then evaluate the four
+retained GRPO checkpoints in descending order:
+
+```bash
+EVAL_GPUS=4,5,6,7 \
+EVAL_WORKERS=16 \
+EVAL_BATCH=32 \
+bash eval_qwen35_4b.sh 20 15 10 5 2>&1 | tee qwen35_4b_eval.out
+```
+
+Calling the script without checkpoint arguments uses the same `20 15 10 5`
+order. Each checkpoint uses full-corpus dual retrieval, one trajectory per
+question, temperature `0.6`, and top-p `0.95`. Results are written to:
+
+```text
+outputs/qwen35_4b/eval_20_strict_v1/0.jsonl
+outputs/qwen35_4b/eval_20_strict_v1/score.json
+outputs/qwen35_4b/eval_15_strict_v1/...
+outputs/qwen35_4b/eval_10_strict_v1/...
+outputs/qwen35_4b/eval_5_strict_v1/...
+```
+
+Use a new `EVAL_TAG` for a clean rerun because existing result directories are
+not overwritten:
+
+```bash
+EVAL_TAG=rerun \
+bash eval_qwen35_4b.sh 20 15 10 5 2>&1 | tee qwen35_4b_eval_rerun.out
+```
+
+The SFT step-28 checkpoint and the untrained base model can be evaluated as
+separate controls:
+
+```bash
+bash eval_qwen35_4b.sh sft
+bash eval_qwen35_4b.sh scaffold
+```
+
+The complete 4B workflow is therefore:
+
+```bash
+bash prepare_qwen35_4b_data.sh sft
+bash train_qwen35_4b.sh sft
+bash prepare_qwen35_4b_data.sh qa
+bash prepare_qwen35_4b_data.sh rollout
+bash prepare_qwen35_4b_data.sh select
+bash train_qwen35_4b.sh rl
+bash prepare_qwen35_4b_data.sh eval
+bash eval_qwen35_4b.sh 20 15 10 5
+```
 
 ## 5. Notes
 
